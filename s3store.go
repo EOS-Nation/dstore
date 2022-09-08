@@ -91,6 +91,15 @@ func NewS3Store(baseURL *url.URL, extension, compressionType string, overwrite b
 	return s, nil
 }
 
+func (s *S3Store) SubStore(subFolder string) (Store, error) {
+	url, err := url.Parse(s.baseURL.String())
+	if err != nil {
+		return nil, fmt.Errorf("s3 store parsing base url: %w", err)
+	}
+	url.Path = path.Join(url.Path, subFolder)
+	return NewS3Store(url, s.extension, s.compressionType, s.overwrite)
+}
+
 func ParseS3URL(s3URL *url.URL) (config *aws.Config, bucket string, path string, err error) {
 	region := s3URL.Query().Get("region")
 	if region == "" {
@@ -186,13 +195,13 @@ func (s *S3Store) WriteObject(ctx context.Context, base string, f io.Reader) (er
 	ctx, cancel := context.WithCancel(ctx)
 
 	go func() {
-		defer pipeWrite.Close()
-
 		err := s.compressedCopy(f, pipeWrite)
+		writeDone <- err
+		pipeWrite.Close() // required to allow the uploader to complete
+
 		if err != nil {
 			cancel()
 		}
-		writeDone <- err
 	}()
 
 	_, err = s.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
@@ -201,13 +210,31 @@ func (s *S3Store) WriteObject(ctx context.Context, base string, f io.Reader) (er
 		Body:   pipeRead,
 	})
 	if err != nil {
-		if err2 := <-writeDone; err2 != nil {
-			return fmt.Errorf("writing through pipe: %s", err2)
+		select {
+		case err2 := <-writeDone:
+			if err2 != nil {
+				return fmt.Errorf("writing through pipe: %w", err2)
+			}
+		default:
+			// error was generated in the Upload (s3 or context timeout), compressedCopy is not finished,
+			// we make it fail. double closing is safe here
+			pipeWrite.Close()
 		}
-		return fmt.Errorf("uploading to S3 through manager: %s", err)
+		return fmt.Errorf("uploading to S3 through manager: %w", err)
 	}
 
 	return nil
+}
+
+func (s *S3Store) CopyObject(ctx context.Context, src, dest string) error {
+	// TODO optimize this
+	reader, err := s.OpenObject(ctx, src)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	return s.WriteObject(ctx, dest, reader)
 }
 
 func (s *S3Store) FileExists(ctx context.Context, base string) (bool, error) {
@@ -228,13 +255,22 @@ func (s *S3Store) FileExists(ctx context.Context, base string) (bool, error) {
 	return true, nil
 }
 
-func (s *S3Store) OpenObject(ctx context.Context, name string) (io.ReadCloser, error) {
+func (s *S3Store) OpenObject(ctx context.Context, name string) (out io.ReadCloser, err error) {
 	path := s.ObjectPath(name)
 
-	var err error
+	if traceEnabled {
+		zlog.Debug("opening dstore file", zap.String("path", s.pathWithExt(name)))
+	}
+
 	for i := 0; i < s3ReadAttempts; i++ {
 		if i > 0 { // small wait on retry
-			zlog.Warn("got an error on s3 OpenObject, retrying", zap.Error(err), zap.Int("attempt", i), zap.Int("max_attempts", s3ReadAttempts))
+			zlog.Warn("got an error on s3 OpenObject, retrying",
+				zap.Error(err),
+				zap.Int("attempt", i),
+				zap.Int("max_attempts", s3ReadAttempts),
+				zap.String("name", name),
+				zap.String("path", path),
+			)
 			time.Sleep(500 * time.Millisecond)
 		}
 		var reader *s3.GetObjectOutput
@@ -257,14 +293,21 @@ func (s *S3Store) OpenObject(ctx context.Context, name string) (io.ReadCloser, e
 			if err = reader.Body.Close(); err != nil {
 				continue
 			}
-			return s.uncompressedReader(ioutil.NopCloser(bytes.NewReader(data)))
+			out, err = s.uncompressedReader(ioutil.NopCloser(bytes.NewReader(data)))
+		} else {
+			out, err = s.uncompressedReader(reader.Body)
 		}
-		return s.uncompressedReader(reader.Body)
+		if traceEnabled {
+			out = wrapReadCloser(out, func() {
+				zlog.Debug("closing dstore file", zap.String("path", s.pathWithExt(name)))
+			})
+		}
+		return out, err
 	}
 	return nil, fmt.Errorf("s3 open object (%d attempts, buffered_read: %v): %w", s3ReadAttempts, bufferedS3Read, err)
 }
 
-func (s *S3Store) Walk(ctx context.Context, prefix, _ string, f func(filename string) (err error)) error {
+func (s *S3Store) WalkFrom(ctx context.Context, prefix, startingPoint string, f func(filename string) (err error)) error {
 	targetPrefix := s.path
 	if targetPrefix != "" {
 		targetPrefix += "/"
@@ -284,11 +327,26 @@ func (s *S3Store) Walk(ctx context.Context, prefix, _ string, f func(filename st
 		Bucket: aws.String(s.bucket),
 		Prefix: &targetPrefix,
 	}
+	// to match 'helloworld.html' by using startAfter, we use 'helloworld.htm' (and we filter again in the walk function  to filter out 'helloworld.htm0')
+	if len(startingPoint) > 1 {
+		rightBeforeStartingPoint := startingPoint[0 : len(startingPoint)-1]
+		q.StartAfter = &rightBeforeStartingPoint
+	}
 
 	var innerErr error
 	err := s.service.ListObjectsV2PagesWithContext(ctx, q, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, el := range page.Contents {
-			if err := f(s.toBaseName(*el.Key)); err != nil {
+			filename := s.toBaseName(*el.Key)
+			if filename == "" {
+				zlog.Warn("got an empty filename from s3 store, ignoring it", zap.String("key", *el.Key))
+				continue
+			}
+			if startingPoint != "" {
+				if filename < startingPoint {
+					continue
+				}
+			}
+			if err := f(filename); err != nil {
 				if err == StopIteration {
 					return false
 				}
@@ -299,13 +357,17 @@ func (s *S3Store) Walk(ctx context.Context, prefix, _ string, f func(filename st
 		return true
 	})
 	if err != nil {
-		return fmt.Errorf("listing objects: %s", err)
+		return fmt.Errorf("listing objects: %w", err)
 	}
 	if innerErr != nil {
-		return fmt.Errorf("processing object list: %s", innerErr)
+		return fmt.Errorf("processing object list: %w", innerErr)
 	}
 
 	return nil
+}
+
+func (s *S3Store) Walk(ctx context.Context, prefix, _ string, f func(filename string) (err error)) error {
+	return s.WalkFrom(ctx, prefix, "", f)
 }
 
 func (s *S3Store) toBaseName(filename string) string {
@@ -318,6 +380,11 @@ func (s *S3Store) DeleteObject(ctx context.Context, base string) error {
 		Bucket: aws.String(s.bucket),
 		Key:    &path,
 	})
+	if aerr, ok := err.(awserr.Error); ok {
+		if aerr.Code() == s3.ErrCodeNoSuchKey {
+			return ErrNotFound
+		}
+	}
 	return err
 }
 
